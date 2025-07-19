@@ -1,7 +1,7 @@
 """
-aurora-data-api - A Python DB-API 2.0 client for the AWS Aurora Serverless Data API
+aurora-data-api-async - An async Python DB-API 2.0 client for the AWS Aurora Serverless Data API
 """
-import os, datetime, ipaddress, uuid, time, random, string, logging, itertools, reprlib, json, re, threading
+import asyncio, os, datetime, ipaddress, uuid, time, random, string, logging, itertools, reprlib, json, re
 from decimal import Decimal
 from collections import namedtuple
 from collections.abc import Mapping
@@ -21,7 +21,7 @@ from .exceptions import (
 )
 from .mysql_error_codes import MySQLErrorCodes
 from .postgresql_error_codes import PostgreSQLErrorCodes
-import boto3
+import aiobotocore.session
 
 apilevel = "2.0"
 
@@ -50,8 +50,6 @@ logger = logging.getLogger(__name__)
 
 
 class AuroraDataAPIClient:
-    _client_init_lock = threading.Lock()
-
     def __init__(
         self,
         dbname=None,
@@ -60,40 +58,64 @@ class AuroraDataAPIClient:
         rds_data_client=None,
         charset=None,
         continue_after_timeout=None,
+        session=None,
     ):
+        self._session = session or aiobotocore.session.get_session()
         self._client = rds_data_client
-        if rds_data_client is None:
-            with self._client_init_lock:
-                self._client = boto3.client("rds-data")
         self._dbname = dbname
         self._aurora_cluster_arn = aurora_cluster_arn or os.environ.get("AURORA_CLUSTER_ARN")
         self._secret_arn = secret_arn or os.environ.get("AURORA_SECRET_ARN")
         self._charset = charset
         self._transaction_id = None
         self._continue_after_timeout = continue_after_timeout
+        self._client_context = None
 
-    def close(self):
-        pass
+    async def __aenter__(self):
+        if self._client is None:
+            self._client_context = self._session.create_client("rds-data")
+            self._client = await self._client_context.__aenter__()
+        return self
 
-    def commit(self):
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        if exc_type is not None:
+            await self.rollback()
+        else:
+            await self.commit()
+        
+        if self._client_context:
+            await self._client_context.__aexit__(exc_type, exc_val, exc_tb)
+            self._client_context = None
+            self._client = None
+
+    async def close(self):
+        if self._client_context:
+            await self._client_context.__aexit__(None, None, None)
+            self._client_context = None
+            self._client = None
+
+    async def commit(self):
         if self._transaction_id:
-            res = self._client.commit_transaction(
+            res = await self._client.commit_transaction(
                 resourceArn=self._aurora_cluster_arn, secretArn=self._secret_arn, transactionId=self._transaction_id
             )
             self._transaction_id = None
             if res["transactionStatus"] != "Transaction Committed":
                 raise DatabaseError("Error while committing transaction: {}".format(res))
 
-    def rollback(self):
+    async def rollback(self):
         if self._transaction_id:
-            self._client.rollback_transaction(
+            await self._client.rollback_transaction(
                 resourceArn=self._aurora_cluster_arn, secretArn=self._secret_arn, transactionId=self._transaction_id
             )
             self._transaction_id = None
 
-    def cursor(self):
+    async def cursor(self):
+        if self._client is None:
+            self._client_context = self._session.create_client("rds-data")
+            self._client = await self._client_context.__aenter__()
+            
         if self._transaction_id is None:
-            res = self._client.begin_transaction(
+            res = await self._client.begin_transaction(
                 database=self._dbname,
                 resourceArn=self._aurora_cluster_arn,
                 # schema="string", TODO
@@ -109,17 +131,8 @@ class AuroraDataAPIClient:
             continue_after_timeout=self._continue_after_timeout,
         )
         if self._charset:
-            cursor.execute("SET character_set_client = '{}'".format(self._charset))
+            await cursor.execute("SET character_set_client = '{}'".format(self._charset))
         return cursor
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, err_type, value, traceback):
-        if err_type is not None:
-            self.rollback()
-        else:
-            self.commit()
 
 
 class AuroraDataAPICursor:
@@ -215,7 +228,7 @@ class AuroraDataAPICursor:
             )
             self.description.append(col_desc)
 
-    def _start_paginated_query(self, execute_statement_args, records_per_page=None):
+    async def _start_paginated_query(self, execute_statement_args, records_per_page=None):
         # MySQL cursors are non-scrollable (https://dev.mysql.com/doc/refman/8.0/en/cursors.html)
         # - may not support page autosizing
         # - FETCH requires INTO - may need to write all results into a server side var and iterate on it
@@ -224,7 +237,7 @@ class AuroraDataAPICursor:
         )
         cursor_stmt = "DECLARE " + pg_cursor_name + " SCROLL CURSOR FOR "
         execute_statement_args["sql"] = cursor_stmt + execute_statement_args["sql"]
-        self._client.execute_statement(**execute_statement_args)
+        await self._client.execute_statement(**execute_statement_args)
         self._paging_state = {
             "execute_statement_args": dict(execute_statement_args),
             "records_per_page": records_per_page or self.arraysize,
@@ -265,7 +278,7 @@ class AuroraDataAPICursor:
             pass
         return DatabaseError(original_error)
 
-    def execute(self, operation, parameters=None):
+    async def execute(self, operation, parameters=None):
         self._current_response, self._iterator, self._paging_state = None, None, None
         execute_statement_args = dict(self._prepare_execute_args(operation), includeResultMetadata=True)
         if self._continue_after_timeout is not None:
@@ -274,18 +287,22 @@ class AuroraDataAPICursor:
             execute_statement_args["parameters"] = self._format_parameter_set(parameters)
         logger.debug("execute %s", reprlib.repr(operation.strip()))
         try:
-            res = self._client.execute_statement(**execute_statement_args)
+            res = await self._client.execute_statement(**execute_statement_args)
             if "columnMetadata" in res:
                 self._set_description(res["columnMetadata"])
             self._current_response = self._render_response(res)
-        except (self._client.exceptions.BadRequestException, self._client.exceptions.DatabaseErrorException) as e:
-            if "Please paginate your query" in str(e):
-                self._start_paginated_query(execute_statement_args)
-            elif "Database returned more than the allowed response size limit" in str(e):
-                self._start_paginated_query(execute_statement_args, records_per_page=max(1, self.arraysize // 2))
+        except Exception as e:
+            # Check for aiobotocore specific exceptions
+            if hasattr(e, 'response') and 'Error' in e.response:
+                if "Please paginate your query" in str(e):
+                    await self._start_paginated_query(execute_statement_args)
+                elif "Database returned more than the allowed response size limit" in str(e):
+                    await self._start_paginated_query(execute_statement_args, records_per_page=max(1, self.arraysize // 2))
+                else:
+                    raise self._get_database_error(e) from e
             else:
                 raise self._get_database_error(e) from e
-        self._iterator = iter(self)
+        self._iterator = self.__aiter__()
 
     @property
     def rowcount(self):
@@ -306,15 +323,15 @@ class AuroraDataAPICursor:
         iterable = iter(iterable)
         return iter(lambda: list(itertools.islice(iterable, page_size)), [])
 
-    def executemany(self, operation, seq_of_parameters):
+    async def executemany(self, operation, seq_of_parameters):
         logger.debug("executemany %s", reprlib.repr(operation.strip()))
         for batch in self._page_input(seq_of_parameters):
             batch_execute_statement_args = dict(
                 self._prepare_execute_args(operation), parameterSets=[self._format_parameter_set(p) for p in batch]
             )
             try:
-                self._client.batch_execute_statement(**batch_execute_statement_args)
-            except self._client.exceptions.BadRequestException as e:
+                await self._client.batch_execute_statement(**batch_execute_statement_args)
+            except Exception as e:
                 raise self._get_database_error(e) from e
 
     def _render_response(self, response):
@@ -353,7 +370,7 @@ class AuroraDataAPICursor:
                             scalar_value = datetime.datetime.strptime(scalar_value, "%Y-%m-%d %H:%M:%S")
             return scalar_value
 
-    def scroll(self, value, mode="relative"):
+    async def scroll(self, value, mode="relative"):
         if not self._paging_state:
             raise InterfaceError("Cursor scroll attempted but pagination is not active")
         scroll_stmt = "MOVE {mode} {value} FROM {pg_cursor_name}".format(
@@ -361,9 +378,9 @@ class AuroraDataAPICursor:
         )
         scroll_args = dict(self._paging_state["execute_statement_args"], sql=scroll_stmt)
         logger.debug("Scrolling cursor %s by %d rows", mode, value)
-        self._client.execute_statement(**scroll_args)
+        await self._client.execute_statement(**scroll_args)
 
-    def __iter__(self):
+    async def __aiter__(self):
         if self._paging_state:
             next_page_args = self._paging_state["execute_statement_args"]
             while True:
@@ -372,11 +389,11 @@ class AuroraDataAPICursor:
                 )
                 next_page_args["sql"] = "FETCH {records_per_page} FROM {pg_cursor_name}".format(**self._paging_state)
                 try:
-                    page = self._client.execute_statement(**next_page_args)
-                except self._client.exceptions.BadRequestException as e:
+                    page = await self._client.execute_statement(**next_page_args)
+                except Exception as e:
                     cur_rpp = self._paging_state["records_per_page"]
                     if "Database returned more than the allowed response size limit" in str(e) and cur_rpp > 1:
-                        self.scroll(-self._paging_state["records_per_page"])  # Rewind the cursor to read the page again
+                        await self.scroll(-self._paging_state["records_per_page"])  # Rewind the cursor to read the page again
                         logger.debug("Halving records per page")
                         self._paging_state["records_per_page"] //= 2
                         continue
@@ -394,26 +411,26 @@ class AuroraDataAPICursor:
             for record in self._current_response.get("records", []):
                 yield record
 
-    def fetchone(self):
+    async def fetchone(self):
         try:
-            return next(self._iterator)
-        except StopIteration:
-            pass
+            return await self._iterator.__anext__()
+        except StopAsyncIteration:
+            return None
 
-    def fetchmany(self, size=None):
+    async def fetchmany(self, size=None):
         if size is None:
             size = self.arraysize
         results = []
         while size > 0:
-            result = self.fetchone()
+            result = await self.fetchone()
             if result is None:
                 break
             results.append(result)
             size -= 1
         return results
 
-    def fetchall(self):
-        return list(self._iterator)
+    async def fetchall(self):
+        return [record async for record in self._iterator]
 
     def setinputsizes(self, sizes):
         pass
@@ -421,18 +438,18 @@ class AuroraDataAPICursor:
     def setoutputsize(self, size, column=None):
         pass
 
-    def close(self):
+    async def close(self):
         pass
 
-    def __enter__(self):
+    async def __aenter__(self):
         return self
 
-    def __exit__(self, err_type, value, traceback):
+    async def __aexit__(self, err_type, value, traceback):
         self._iterator = None
         self._current_response = None
 
 
-def connect(
+async def connect(
     aurora_cluster_arn=None,
     secret_arn=None,
     rds_data_client=None,
@@ -443,12 +460,15 @@ def connect(
     password=None,
     charset=None,
     continue_after_timeout=None,
+    session=None,
 ):
-    return AuroraDataAPIClient(
+    client = AuroraDataAPIClient(
         dbname=database,
         aurora_cluster_arn=aurora_cluster_arn,
         secret_arn=secret_arn,
         rds_data_client=rds_data_client,
         charset=charset,
         continue_after_timeout=continue_after_timeout,
+        session=session,
     )
+    return await client.__aenter__()

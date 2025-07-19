@@ -1,11 +1,11 @@
-aurora-data-api - A Python DB-API 2.0 client for the AWS Aurora Serverless v1 and v2 Data API
+aurora-data-api-async - A Python DB-API 2.0 client for the AWS Aurora Serverless v1 and v2 Data API with aiobotocore
 =============================================================================================
 
 Installation
 ------------
 ::
 
-    pip install aurora-data-api
+    pip install aurora-data-api-async
 
 Prerequisites
 -------------
@@ -57,21 +57,21 @@ the standard main entry point, and accepts two implementation-specific keyword a
 
 .. code-block:: python
 
-    import aurora_data_api
+    import aurora_data_api_async
 
     cluster_arn = "arn:aws:rds:us-east-1:123456789012:cluster:my-aurora-serverless-cluster"
     secret_arn = "arn:aws:secretsmanager:us-east-1:123456789012:secret:rds-db-credentials/MY_DB"
-    with aurora_data_api.connect(aurora_cluster_arn=cluster_arn, secret_arn=secret_arn, database="my_db") as conn:
-        with conn.cursor() as cursor:
-            cursor.execute("select * from pg_catalog.pg_tables")
-            print(cursor.fetchall())
+   async with await aurora_data_api_async.connect(aurora_cluster_arn=cluster_arn, secret_arn=secret_arn, database="my_db") as conn:
+        async with await conn.cursor() as cursor:
+            await cursor.execute("select * from pg_catalog.pg_tables")
+            print(await cursor.fetchall())
 
 The cursor supports iteration (and automatically wraps the query in a server-side cursor and paginates it if required):
 
 .. code-block:: python
 
-    with conn.cursor() as cursor:
-        for row in cursor.execute("select * from pg_catalog.pg_tables"):
+    async with await conn.cursor() as cursor:
+        async for row in cursor.execute("select * from pg_catalog.pg_tables"):
             print(row)
 
 Motivation
