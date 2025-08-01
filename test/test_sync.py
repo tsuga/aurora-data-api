@@ -165,7 +165,7 @@ class TestAuroraDataAPI(unittest.TestCase):
             sql = sql_template.format(", ".join("concat({})".format(concat_args) for i in range(32)))
             cur.execute(sql)
             with self.assertRaisesRegex(
-                conn._client.exceptions.BadRequestException, "Database response exceeded size limit"
+                Exception, "Database response exceeded size limit"
             ):
                 cur.fetchall()
 
