@@ -2,10 +2,10 @@ import logging
 import os
 import sys
 import unittest
+import aurora_data_api
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-import aurora_data_api
 from base import CoreAuroraDataAPITest, PEP249ConformanceTestMixin
 
 logging.basicConfig(level=logging.INFO)
