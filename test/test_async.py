@@ -333,6 +333,68 @@ class TestAuroraDataAPI(BaseAuroraDataAPITest, AsyncTestCase):
                         cur = await conn.cursor()
                         await cur.execute("DELETE FROM aurora_data_api_test WHERE name = 'continue_after_timeout'")
 
+    @AsyncTestCase.async_test
+    async def test_skip_begin_transaction_behavior(self):
+        """Test that skip_begin_transaction actually controls transaction behavior"""
+        if self.using_mysql:
+            self.skipTest("PostgreSQL-specific transaction behavior test")
+        
+        # Test with skip_begin_transaction=False (default behavior - should use transactions)
+        with self.subTest(skip_begin_transaction=False):
+            conn = await self.get_connection(skip_begin_transaction=False)
+            async with conn:
+                cur = await conn.cursor()
+                
+                # Insert a test record
+                await cur.execute(
+                    "INSERT INTO aurora_data_api_test(name, doc) VALUES (:name, CAST(:doc AS JSONB))",
+                    {"name": "transaction_test_false", "doc": '{"test": "skip_false"}'}
+                )
+                
+                # Check if we can see the record in the same transaction
+                await cur.execute("SELECT COUNT(*) FROM aurora_data_api_test WHERE name = 'transaction_test_false'")
+                count = await cur.fetchone()
+                self.assertEqual(count[0], 1, "Record should be visible within the same transaction")
+                
+                # The record should be committed when the connection closes
+            
+            # Verify the record was committed
+            conn2 = await self.get_connection(skip_begin_transaction=False)
+            async with conn2:
+                cur2 = await conn2.cursor()
+                await cur2.execute("SELECT COUNT(*) FROM aurora_data_api_test WHERE name = 'transaction_test_false'")
+                count = await cur2.fetchone()
+                self.assertEqual(count[0], 1, "Record should be committed after transaction")
+                
+                # Clean up
+                await cur2.execute("DELETE FROM aurora_data_api_test WHERE name = 'transaction_test_false'")
+        
+        # Test with skip_begin_transaction=True (no automatic transactions)
+        with self.subTest(skip_begin_transaction=True):
+            conn = await self.get_connection(skip_begin_transaction=True)
+            async with conn:
+                cur = await conn.cursor()
+                
+                # Insert a test record (should auto-commit immediately)
+                await cur.execute(
+                    "INSERT INTO aurora_data_api_test(name, doc) VALUES (:name, CAST(:doc AS JSONB))",
+                    {"name": "transaction_test_true", "doc": '{"test": "skip_true"}'}
+                )
+                
+                # Record should be immediately visible from another connection
+                # because each statement auto-commits when skip_begin_transaction=True
+            
+            # Verify the record is immediately available (auto-committed)
+            conn2 = await self.get_connection(skip_begin_transaction=True)
+            async with conn2:
+                cur2 = await conn2.cursor()
+                await cur2.execute("SELECT COUNT(*) FROM aurora_data_api_test WHERE name = 'transaction_test_true'")
+                count = await cur2.fetchone()
+                self.assertEqual(count[0], 1, "Record should be auto-committed immediately with skip_begin_transaction=True")
+                
+                # Clean up
+                await cur2.execute("DELETE FROM aurora_data_api_test WHERE name = 'transaction_test_true'")
+
 
 class TestAuroraDataAPIConformance(PEP249ConformanceTestMixin, CoreAuroraDataAPITest):
     """Conformance test class for asynchronous tests. Sets up connection to run tests."""
