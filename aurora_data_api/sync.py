@@ -46,18 +46,36 @@ class SyncAuroraDataAPIClient(BaseAuroraDataAPIClient):
 
     def __init__(
         self,
+        client=None,
         dbname=None,
         aurora_cluster_arn=None,
         secret_arn=None,
-        rds_data_client=None,
         charset=None,
+        transaction_id=None,
+        skip_begin_transaction=False,
         continue_after_timeout=None,
     ):
-        super().__init__(dbname, aurora_cluster_arn, secret_arn, rds_data_client, charset, continue_after_timeout)
-        if rds_data_client is None:
+        super().__init__(
+            client=client,
+            dbname=dbname,
+            aurora_cluster_arn=aurora_cluster_arn,
+            secret_arn=secret_arn,
+            charset=charset,
+            transaction_id=transaction_id,
+            skip_begin_transaction=skip_begin_transaction,
+            continue_after_timeout=continue_after_timeout,
+        )
+        if self._client is None:
             with self._client_init_lock:
                 session = botocore.session.get_session()
                 self._client = session.create_client("rds-data")
+
+    def close(self):
+        if self._transaction_id is not None:
+            try:
+                self.rollback()
+            except Exception:
+                pass
 
     def commit(self):
         if self._transaction_id:
@@ -76,7 +94,9 @@ class SyncAuroraDataAPIClient(BaseAuroraDataAPIClient):
             self._transaction_id = None
 
     def cursor(self):
-        if self._transaction_id is None:
+        if not self._skip_begin_transaction and self._transaction_id is None:
+            self._begin_check()
+
             res = self._client.begin_transaction(
                 database=self._dbname,
                 resourceArn=self._aurora_cluster_arn,
@@ -84,6 +104,7 @@ class SyncAuroraDataAPIClient(BaseAuroraDataAPIClient):
                 secretArn=self._secret_arn,
             )
             self._transaction_id = res["transactionId"]
+
         cursor = SyncAuroraDataAPICursor(
             client=self._client,
             dbname=self._dbname,
@@ -116,7 +137,14 @@ class SyncAuroraDataAPICursor(BaseAuroraDataAPICursor):
         transaction_id=None,
         continue_after_timeout=None,
     ):
-        super().__init__(client, dbname, aurora_cluster_arn, secret_arn, transaction_id, continue_after_timeout)
+        super().__init__(
+            client=client,
+            dbname=dbname,
+            aurora_cluster_arn=aurora_cluster_arn,
+            secret_arn=secret_arn,
+            transaction_id=transaction_id,
+            continue_after_timeout=continue_after_timeout,
+        )
 
     def _start_paginated_query(self, execute_statement_args, records_per_page=None):
         # MySQL cursors are non-scrollable (https://dev.mysql.com/doc/refman/8.0/en/cursors.html)
@@ -229,6 +257,9 @@ class SyncAuroraDataAPICursor(BaseAuroraDataAPICursor):
     def fetchall(self):
         return list(self._iterator)
 
+    def close(self):
+        pass
+
     def __enter__(self):
         return self
 
@@ -242,18 +273,16 @@ def connect(
     secret_arn=None,
     rds_data_client=None,
     database=None,
-    host=None,
-    port=None,
-    username=None,
-    password=None,
     charset=None,
+    skip_begin_transaction=False,
     continue_after_timeout=None,
 ):
     return SyncAuroraDataAPIClient(
+        client=rds_data_client,
         dbname=database,
         aurora_cluster_arn=aurora_cluster_arn,
         secret_arn=secret_arn,
-        rds_data_client=rds_data_client,
         charset=charset,
+        skip_begin_transaction=skip_begin_transaction,
         continue_after_timeout=continue_after_timeout,
     )

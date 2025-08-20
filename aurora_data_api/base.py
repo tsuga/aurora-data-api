@@ -56,23 +56,42 @@ class BaseAuroraDataAPIClient:
 
     def __init__(
         self,
+        client=None,
         dbname=None,
         aurora_cluster_arn=None,
         secret_arn=None,
-        rds_data_client=None,
         charset=None,
+        transaction_id=None,
+        skip_begin_transaction=False,
         continue_after_timeout=None,
     ):
-        self._client = rds_data_client
+        self._client = client
         self._dbname = dbname
         self._aurora_cluster_arn = aurora_cluster_arn or os.environ.get("AURORA_CLUSTER_ARN")
         self._secret_arn = secret_arn or os.environ.get("AURORA_SECRET_ARN")
         self._charset = charset
         self._transaction_id = None
+        self._skip_begin_transaction = skip_begin_transaction
         self._continue_after_timeout = continue_after_timeout
 
-    def close(self):
-        pass
+        if skip_begin_transaction and transaction_id:
+            raise ValueError(
+                "Cannot skip BeginTransaction when a transaction ID is provided. "
+                "Either provide a transaction ID or set skip_begin_transaction to False."
+            )
+
+    def _begin_check(self):
+        if self._skip_begin_transaction:
+            raise NotSupportedError(
+                "Skip BeginTransaction mode does not support explicit transactions. "
+                "Each statement is executed individually."
+            )
+
+        if self._transaction_id is not None:
+            raise DatabaseError(
+                "Cannot begin transaction: Data API connection already has "
+                "an active transaction. Nested transactions are not supported."
+            )
 
 
 class BaseAuroraDataAPICursor:
@@ -263,7 +282,4 @@ class BaseAuroraDataAPICursor:
         pass
 
     def setoutputsize(self, size, column=None):
-        pass
-
-    def close(self):
         pass

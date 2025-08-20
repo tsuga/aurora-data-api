@@ -43,16 +43,28 @@ import aiobotocore.session
 class AsyncAuroraDataAPIClient(BaseAuroraDataAPIClient):
     def __init__(
         self,
+        client=None,
         dbname=None,
         aurora_cluster_arn=None,
         secret_arn=None,
-        rds_data_client=None,
         charset=None,
+        transaction_id=None,
+        skip_begin_transaction=False,
         continue_after_timeout=None,
     ):
-        super().__init__(dbname, aurora_cluster_arn, secret_arn, rds_data_client, charset, continue_after_timeout)
+        super().__init__(
+            client=client,
+            dbname=dbname,
+            aurora_cluster_arn=aurora_cluster_arn,
+            secret_arn=secret_arn,
+            charset=charset,
+            transaction_id=transaction_id,
+            skip_begin_transaction=skip_begin_transaction,
+            continue_after_timeout=continue_after_timeout,
+        )
+
         self._session = None
-        if rds_data_client is None:
+        if self._client is None:
             self._session = aiobotocore.session.get_session()
             self._client = None  # Will be created when needed
         self._client_context = None
@@ -87,7 +99,8 @@ class AsyncAuroraDataAPIClient(BaseAuroraDataAPIClient):
             self._transaction_id = None
 
     async def cursor(self):
-        if self._transaction_id is None:
+        if not self._skip_begin_transaction and self._transaction_id is None:
+            self._begin_check()
             await self._ensure_client()
             res = await self._client.begin_transaction(
                 database=self._dbname,
@@ -96,6 +109,7 @@ class AsyncAuroraDataAPIClient(BaseAuroraDataAPIClient):
                 secretArn=self._secret_arn,
             )
             self._transaction_id = res["transactionId"]
+
         cursor = AsyncAuroraDataAPICursor(
             client=self._client,
             dbname=self._dbname,
@@ -279,18 +293,16 @@ async def connect(
     secret_arn=None,
     rds_data_client=None,
     database=None,
-    host=None,
-    port=None,
-    username=None,
-    password=None,
     charset=None,
+    skip_begin_transaction=False,
     continue_after_timeout=None,
 ):
     return AsyncAuroraDataAPIClient(
+        client=rds_data_client,
         dbname=database,
         aurora_cluster_arn=aurora_cluster_arn,
         secret_arn=secret_arn,
-        rds_data_client=rds_data_client,
         charset=charset,
+        skip_begin_transaction=skip_begin_transaction,
         continue_after_timeout=continue_after_timeout,
     )
