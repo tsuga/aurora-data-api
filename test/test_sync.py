@@ -23,13 +23,9 @@ class TestAuroraDataAPI(BaseAuroraDataAPITest):
 
     def get_connect_kwargs(self, skip_begin_transaction=None, exclude_keys=None):
         """Get connection kwargs with optional skip_begin_transaction parameter"""
-        kwargs = {
-            'database': self.db_name,
-            'aurora_cluster_arn': self.cluster_arn,
-            'secret_arn': self.secret_arn
-        }
+        kwargs = {"database": self.db_name, "aurora_cluster_arn": self.cluster_arn, "secret_arn": self.secret_arn}
         if skip_begin_transaction is not None:
-            kwargs['skip_begin_transaction'] = skip_begin_transaction
+            kwargs["skip_begin_transaction"] = skip_begin_transaction
         if exclude_keys:
             for key in exclude_keys:
                 kwargs.pop(key, None)
@@ -76,7 +72,9 @@ class TestAuroraDataAPI(BaseAuroraDataAPITest):
                     sync.connect(**self.get_connect_kwargs(skip_begin_transaction)) as conn,
                     conn.cursor() as cur,
                 ):
-                    with self.assertRaises((exceptions.PostgreSQLError.ER_SYNTAX_ERR, exceptions.MySQLError.ER_PARSE_ERROR)):
+                    with self.assertRaises(
+                        (exceptions.PostgreSQLError.ER_SYNTAX_ERR, exceptions.MySQLError.ER_PARSE_ERROR)
+                    ):
                         cur.execute("selec * from table")
 
     def test_iterators(self):
@@ -88,13 +86,21 @@ class TestAuroraDataAPI(BaseAuroraDataAPITest):
                     conn.cursor() as cur,
                 ):
                     if not self.using_mysql:
-                        cur.execute("select count(*) from aurora_data_api_test where pg_column_size(doc) < :s", dict(s=2**6))
+                        cur.execute(
+                            "select count(*) from aurora_data_api_test where pg_column_size(doc) < :s", dict(s=2**6)
+                        )
                         self.assertEqual(cur.fetchone()[0], 0)
-                        cur.execute("select count(*) from aurora_data_api_test where pg_column_size(doc) < :s", dict(s=2**7))
+                        cur.execute(
+                            "select count(*) from aurora_data_api_test where pg_column_size(doc) < :s", dict(s=2**7)
+                        )
                         self.assertEqual(cur.fetchone()[0], 1977)
-                        cur.execute("select count(*) from aurora_data_api_test where pg_column_size(doc) < :s", dict(s=2**8))
+                        cur.execute(
+                            "select count(*) from aurora_data_api_test where pg_column_size(doc) < :s", dict(s=2**8)
+                        )
                         self.assertEqual(cur.fetchone()[0], 2048)
-                        cur.execute("select count(*) from aurora_data_api_test where pg_column_size(doc) < :s", dict(s=2**10))
+                        cur.execute(
+                            "select count(*) from aurora_data_api_test where pg_column_size(doc) < :s", dict(s=2**10)
+                        )
                         self.assertEqual(cur.fetchone()[0], 2048)
 
                     with conn.cursor() as cursor:
@@ -113,7 +119,9 @@ class TestAuroraDataAPI(BaseAuroraDataAPITest):
                         self.assertEqual(data[-1][0], 2048)
                         self.assertEqual(data[-1][1], "row2047")
                         if not self.using_mysql:
-                            self.assertEqual(json.loads(data[-1][2]), {"x": 2047, "y": str(2047), "z": [2047, 2047 * 2047, 0]})
+                            self.assertEqual(
+                                json.loads(data[-1][2]), {"x": 2047, "y": str(2047), "z": [2047, 2047 * 2047, 0]}
+                            )
                         self.assertEqual(data[-1][-2], decimal.Decimal("2047.2047"))
                         self.assertEqual(len(data), 2048)
                         self.assertEqual(len(cursor.fetchall()), 0)
@@ -241,7 +249,9 @@ class TestAuroraDataAPI(BaseAuroraDataAPITest):
                                 )
                             )
                         with self.assertRaisesRegex(exceptions.DatabaseError, "current transaction is aborted"):
-                            cur.execute("SELECT COUNT(*) FROM aurora_data_api_test WHERE name = 'continue_after_timeout'")
+                            cur.execute(
+                                "SELECT COUNT(*) FROM aurora_data_api_test WHERE name = 'continue_after_timeout'"
+                            )
 
                     with (
                         sync.connect(**self.get_connect_kwargs(skip_begin_transaction)) as conn,
@@ -250,7 +260,14 @@ class TestAuroraDataAPI(BaseAuroraDataAPITest):
                         cur.execute("SELECT COUNT(*) FROM aurora_data_api_test WHERE name = 'continue_after_timeout'")
                         self.assertEqual(cur.fetchone(), (0,))
 
-                    with sync.connect(database=self.db_name, continue_after_timeout=True, **self.get_connect_kwargs(skip_begin_transaction, exclude_keys=["database"])) as conn, conn.cursor() as cur:
+                    with (
+                        sync.connect(
+                            database=self.db_name,
+                            continue_after_timeout=True,
+                            **self.get_connect_kwargs(skip_begin_transaction, exclude_keys=["database"]),
+                        ) as conn,
+                        conn.cursor() as cur,
+                    ):
                         with self.assertRaisesRegex(conn._client.exceptions.ClientError, "StatementTimeoutException"):
                             cur.execute(
                                 (
@@ -271,7 +288,7 @@ class TestAuroraDataAPI(BaseAuroraDataAPITest):
         """Test that skip_begin_transaction actually controls transaction behavior"""
         if self.using_mysql:
             self.skipTest("PostgreSQL-specific transaction behavior test")
-        
+
         # Test with skip_begin_transaction=False (default behavior - should use transactions)
         with self.subTest(skip_begin_transaction=False):
             with (
@@ -281,16 +298,16 @@ class TestAuroraDataAPI(BaseAuroraDataAPITest):
                 # Insert a test record
                 cur.execute(
                     "INSERT INTO aurora_data_api_test(name, doc) VALUES (:name, CAST(:doc AS JSONB))",
-                    {"name": "transaction_test_false", "doc": '{"test": "skip_false"}'}
+                    {"name": "transaction_test_false", "doc": '{"test": "skip_false"}'},
                 )
-                
+
                 # Check if we can see the record in the same transaction
                 cur.execute("SELECT COUNT(*) FROM aurora_data_api_test WHERE name = 'transaction_test_false'")
                 count = cur.fetchone()
                 self.assertEqual(count[0], 1, "Record should be visible within the same transaction")
-                
+
                 # The record should be committed when the connection closes
-            
+
             # Verify the record was committed
             with (
                 sync.connect(**self.get_connect_kwargs(skip_begin_transaction=False)) as conn2,
@@ -299,10 +316,10 @@ class TestAuroraDataAPI(BaseAuroraDataAPITest):
                 cur2.execute("SELECT COUNT(*) FROM aurora_data_api_test WHERE name = 'transaction_test_false'")
                 count = cur2.fetchone()
                 self.assertEqual(count[0], 1, "Record should be committed after transaction")
-                
+
                 # Clean up
                 cur2.execute("DELETE FROM aurora_data_api_test WHERE name = 'transaction_test_false'")
-        
+
         # Test with skip_begin_transaction=True (no automatic transactions)
         with self.subTest(skip_begin_transaction=True):
             with (
@@ -312,12 +329,12 @@ class TestAuroraDataAPI(BaseAuroraDataAPITest):
                 # Insert a test record (should auto-commit immediately)
                 cur.execute(
                     "INSERT INTO aurora_data_api_test(name, doc) VALUES (:name, CAST(:doc AS JSONB))",
-                    {"name": "transaction_test_true", "doc": '{"test": "skip_true"}'}
+                    {"name": "transaction_test_true", "doc": '{"test": "skip_true"}'},
                 )
-                
+
                 # Record should be immediately visible from another connection
                 # because each statement auto-commits when skip_begin_transaction=True
-            
+
             # Verify the record is immediately available (auto-committed)
             with (
                 sync.connect(**self.get_connect_kwargs(skip_begin_transaction=True)) as conn2,
@@ -325,8 +342,10 @@ class TestAuroraDataAPI(BaseAuroraDataAPITest):
             ):
                 cur2.execute("SELECT COUNT(*) FROM aurora_data_api_test WHERE name = 'transaction_test_true'")
                 count = cur2.fetchone()
-                self.assertEqual(count[0], 1, "Record should be auto-committed immediately with skip_begin_transaction=True")
-                
+                self.assertEqual(
+                    count[0], 1, "Record should be auto-committed immediately with skip_begin_transaction=True"
+                )
+
                 # Clean up
                 cur2.execute("DELETE FROM aurora_data_api_test WHERE name = 'transaction_test_true'")
 
