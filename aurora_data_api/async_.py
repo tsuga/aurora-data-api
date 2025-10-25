@@ -164,6 +164,13 @@ class AsyncAuroraDataAPIClient(BaseAuroraDataAPIClient):
             # Safely cleanup old client if exists
             await self._safe_cleanup_client()
 
+            # Close old session if exists
+            if self._session is not None:
+                try:
+                    await self._session.close()
+                except Exception:
+                    pass
+
             # Create new session/client (always create new session on event loop change)
             self._session = aiobotocore.session.get_session()
             self._client_context = self._session.create_client("rds-data")
@@ -175,6 +182,16 @@ class AsyncAuroraDataAPIClient(BaseAuroraDataAPIClient):
 
     async def close(self):
         await self._safe_cleanup_client()
+
+        # Close aiobotocore session (releases internal aiohttp ClientSession)
+        if self._session is not None:
+            try:
+                await self._session.close()
+            except Exception as e:
+                logger.debug(f"Failed to close aiobotocore session: {e}")
+            finally:
+                self._session = None
+
         # Reset event loop tracking info
         self._event_loop = None
         self._event_loop_ref = None
