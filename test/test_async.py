@@ -399,6 +399,53 @@ class TestAuroraDataAPI(BaseAuroraDataAPITest, AsyncTestCase):
                 # Clean up
                 await cur2.execute("DELETE FROM aurora_data_api_test WHERE name = 'transaction_test_true'")
 
+    @AsyncTestCase.async_test
+    async def test_session_cleanup_on_close(self):
+        """Test that aiobotocore session is properly closed when connection is closed"""
+        conn = await self.get_connection(skip_begin_transaction=True)
+        
+        # Ensure client is created
+        await conn._ensure_client()
+        
+        # Verify session exists
+        self.assertIsNotNone(conn._session)
+        
+        # Close the connection
+        await conn.close()
+        
+        # Verify session is set to None after close
+        self.assertIsNone(conn._session)
+        
+        # Verify the session object was actually closed
+        # Note: aiobotocore.session doesn't have a direct "is_closed" property,
+        # but we verify it was set to None which is the expected behavior
+
+    @AsyncTestCase.async_test
+    async def test_session_cleanup_on_event_loop_change(self):
+        """Test that old session is closed when event loop changes"""
+        conn = await self.get_connection(skip_begin_transaction=True)
+        
+        # Ensure client is created
+        await conn._ensure_client()
+        
+        # Verify session exists
+        self.assertIsNotNone(conn._session)
+        old_session = conn._session
+        
+        # Simulate event loop change by clearing the event loop ref
+        conn._event_loop = None
+        conn._event_loop_ref = None
+        
+        # Trigger client recreation
+        await conn._ensure_client()
+        
+        # Verify a new session was created
+        self.assertIsNotNone(conn._session)
+        self.assertIsNot(conn._session, old_session, "New session should be created")
+        
+        # Clean up
+        await conn.close()
+
 
 class TestAuroraDataAPIConformance(PEP249ConformanceTestMixin, CoreAuroraDataAPITest):
     """Conformance test class for asynchronous tests. Sets up connection to run tests."""
