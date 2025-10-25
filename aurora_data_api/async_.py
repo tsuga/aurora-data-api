@@ -168,8 +168,10 @@ class AsyncAuroraDataAPIClient(BaseAuroraDataAPIClient):
             if self._session is not None:
                 try:
                     await self._session.close()
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug(f"Failed to close old aiobotocore session: {e}")
+                finally:
+                    self._session = None
 
             # Create new session/client (always create new session on event loop change)
             self._session = aiobotocore.session.get_session()
