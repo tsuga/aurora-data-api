@@ -70,133 +70,50 @@ class AsyncAuroraDataAPIClient(BaseAuroraDataAPIClient):
             self._session = aiobotocore.session.get_session()
             self._client = None  # Will be created when needed
         self._client_context = None
-
-        # Attributes for tracking event loop changes
-        self._event_loop = None
-        self._event_loop_ref = None
-
-    async def _safe_cleanup_client(self):
-        """Safe client cleanup considering event loop state"""
-        if not self._client_context:
-            return
-
-        try:
-            # Check if current event loop is valid
-            try:
-                current_loop = asyncio.get_running_loop()
-
-                # Check if event loop is closed
-                if current_loop.is_closed():
-                    # Skip cleanup if already closed
-                    return
-            except RuntimeError:
-                # Skip if no event loop
-                return
-
-            # Execute normal cleanup
-            await self._client_context.__aexit__(None, None, None)
-
-        except RuntimeError as e:
-            error_msg = str(e).lower()
-            if any(
-                msg in error_msg
-                for msg in [
-                    "event loop is closed",
-                    "cannot call on a closed event loop",
-                    "event loop is already closed",
-                ]
-            ):
-                # Ignore only event loop related errors
-                pass
-            else:
-                raise
-
-        except (ConnectionError, OSError) as e:
-            # Ignore network-related cleanup errors
-            error_msg = str(e).lower()
-            if any(
-                msg in error_msg
-                for msg in [
-                    "cannot connect to host",
-                    "connection broken",
-                    "connection reset",
-                    "connection closed",
-                    "unclosed client session",
-                    "unclosed connector",
-                ]
-            ):
-                pass
-            else:
-                raise
-
-        except Exception as e:
-            # Check for aiohttp/aiobotocore internal errors
-            error_msg = str(e).lower()
-            if any(
-                msg in error_msg for msg in ["session is closed", "connector is closed", "client session is closed"]
-            ):
-                pass
-            else:
-                # Re-raise unexpected errors
-                raise
-        finally:
-            # Ensure cleanup
-            self._client_context = None
-            self._client = None
+        self._loop = None  # Track which event loop the client was created in
 
     async def _ensure_client(self):
-        # Get current event loop
+        # Get the current event loop
         try:
             current_loop = asyncio.get_running_loop()
         except RuntimeError:
-            # Do nothing if no event loop
-            return
+            current_loop = None
 
-        # Check if event loop changed or client not created yet
-        needs_new_client = (
-            self._event_loop is None
-            or self._event_loop_ref is None
-            or self._event_loop_ref() is not current_loop
-            or self._client is None
+        # Check if we need to create a new client:
+        # 1. Client doesn't exist, OR
+        # 2. Event loop has changed (client bound to different loop)
+        need_new_client = (
+            self._client is None
+            or (self._loop is not None and current_loop is not None and self._loop != current_loop)
         )
 
-        if needs_new_client:
-            # Safely cleanup old client if exists
-            await self._safe_cleanup_client()
-
-            # Close old session if exists
-            if self._session is not None:
+        if need_new_client:
+            # Close old client if it exists
+            if self._client_context:
                 try:
-                    await self._session.close()
-                except Exception as e:
-                    logger.debug(f"Failed to close old aiobotocore session: {e}")
+                    await self._client_context.__aexit__(None, None, None)
+                except Exception:
+                    pass
                 finally:
-                    self._session = None
+                    self._client_context = None
+                    self._client = None
 
-            # Create new session/client (always create new session on event loop change)
+            # Create new client in the current event loop
             self._session = aiobotocore.session.get_session()
             self._client_context = self._session.create_client("rds-data")
             self._client = await self._client_context.__aenter__()
-
-            # Record current event loop (use weak reference to avoid circular refs)
-            self._event_loop = current_loop
-            self._event_loop_ref = weakref.ref(current_loop)
+            self._loop = current_loop
 
     async def close(self):
-        await self._safe_cleanup_client()
-
-        # Close aiobotocore session (releases internal aiohttp ClientSession)
-        if self._session is not None:
+        if self._client_context:
             try:
-                await self._session.close()
-            except Exception as e:
-                logger.debug(f"Failed to close aiobotocore session: {e}")
+                await self._client_context.__aexit__(None, None, None)
+            except Exception:
+                pass
             finally:
-                self._session = None
-
-        # Reset event loop tracking info
-        self._event_loop = None
-        self._event_loop_ref = None
+                self._client_context = None
+                self._client = None
+                self._loop = None
 
     async def commit(self):
         if self._transaction_id:
