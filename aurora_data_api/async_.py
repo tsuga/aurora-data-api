@@ -7,7 +7,7 @@ import random
 import string
 import reprlib
 import asyncio
-import weakref
+import contextvars
 from .base import BaseAuroraDataAPIClient, BaseAuroraDataAPICursor, logger
 from .base import (
     apilevel,  # noqa: F401
@@ -41,6 +41,10 @@ from .exceptions import (
 )
 import aiobotocore.session
 
+# Context variable to store RDS Data API client per event loop context
+# Store tuple of (client, client_context, event_loop_id) to detect event loop changes
+_rds_data_client_context = contextvars.ContextVar("rds_data_client", default=None)
+
 
 class AsyncAuroraDataAPIClient(BaseAuroraDataAPIClient):
     def __init__(
@@ -65,138 +69,74 @@ class AsyncAuroraDataAPIClient(BaseAuroraDataAPIClient):
             continue_after_timeout=continue_after_timeout,
         )
 
-        self._session = None
-        if self._client is None:
-            self._session = aiobotocore.session.get_session()
-            self._client = None  # Will be created when needed
         self._client_context = None
 
-        # Attributes for tracking event loop changes
-        self._event_loop = None
-        self._event_loop_ref = None
-
-    async def _safe_cleanup_client(self):
-        """Safe client cleanup considering event loop state"""
-        if not self._client_context:
-            return
-
-        try:
-            # Check if current event loop is valid
-            try:
-                current_loop = asyncio.get_running_loop()
-
-                # Check if event loop is closed
-                if current_loop.is_closed():
-                    # Skip cleanup if already closed
-                    return
-            except RuntimeError:
-                # Skip if no event loop
-                return
-
-            # Execute normal cleanup
-            await self._client_context.__aexit__(None, None, None)
-
-        except RuntimeError as e:
-            error_msg = str(e).lower()
-            if any(
-                msg in error_msg
-                for msg in [
-                    "event loop is closed",
-                    "cannot call on a closed event loop",
-                    "event loop is already closed",
-                ]
-            ):
-                # Ignore only event loop related errors
-                pass
-            else:
-                raise
-
-        except (ConnectionError, OSError) as e:
-            # Ignore network-related cleanup errors
-            error_msg = str(e).lower()
-            if any(
-                msg in error_msg
-                for msg in [
-                    "cannot connect to host",
-                    "connection broken",
-                    "connection reset",
-                    "connection closed",
-                    "unclosed client session",
-                    "unclosed connector",
-                ]
-            ):
-                pass
-            else:
-                raise
-
-        except Exception as e:
-            # Check for aiohttp/aiobotocore internal errors
-            error_msg = str(e).lower()
-            if any(
-                msg in error_msg for msg in ["session is closed", "connector is closed", "client session is closed"]
-            ):
-                pass
-            else:
-                # Re-raise unexpected errors
-                raise
-        finally:
-            # Ensure cleanup
-            self._client_context = None
-            self._client = None
+        # Track if we own the client (created it) vs using external client
+        self._owns_client = self._client is None
 
     async def _ensure_client(self):
-        # Get current event loop
-        try:
-            current_loop = asyncio.get_running_loop()
-        except RuntimeError:
-            # Do nothing if no event loop
-            return
+        """Ensure RDS Data API client is available for current event loop context."""
+        # Get current event loop ID
+        current_loop_id = id(asyncio.get_running_loop())
 
-        # Check if event loop changed or client not created yet
-        needs_new_client = (
-            self._event_loop is None
-            or self._event_loop_ref is None
-            or self._event_loop_ref() is not current_loop
-            or self._client is None
-        )
+        # If external client provided, take ownership for event loop safety
+        if not self._owns_client:
+            logger.debug("External client detected, taking ownership for event loop safety")
+            self._owns_client = True
 
-        if needs_new_client:
-            # Safely cleanup old client if exists
-            await self._safe_cleanup_client()
+        # Check if client exists in current context
+        stored = _rds_data_client_context.get()
 
-            # Close old session if exists
-            if self._session is not None:
-                try:
-                    await self._session.close()
-                except Exception as e:
-                    logger.debug(f"Failed to close old aiobotocore session: {e}")
-                finally:
-                    self._session = None
-
-            # Create new session/client (always create new session on event loop change)
-            self._session = aiobotocore.session.get_session()
-            self._client_context = self._session.create_client("rds-data")
+        if stored is None:
+            # Create new client for this event loop context
+            logger.debug(f"Creating new RDS Data API client for event loop {current_loop_id}")
+            # Create a fresh AioSession for each event loop to avoid aiohttp loop conflicts
+            session = aiobotocore.session.AioSession()
+            self._client_context = session.create_client("rds-data")
             self._client = await self._client_context.__aenter__()
+            # Store client, context manager, and event loop ID
+            _rds_data_client_context.set((self._client, self._client_context, current_loop_id))
+        else:
+            # Check if event loop has changed
+            stored_client, stored_context, stored_loop_id = stored
+            if stored_loop_id == current_loop_id:
+                # Reuse existing client from same event loop
+                logger.debug(f"Reusing existing RDS Data API client for event loop {current_loop_id}")
+                self._client, self._client_context = stored_client, stored_context
+            else:
+                # Event loop changed - do NOT close old client as other contexts may still use it
+                # Just create a new client for this context and let garbage collection handle cleanup
+                logger.info(f"Event loop changed from {stored_loop_id} to {current_loop_id}, creating new client without closing old one")
 
-            # Record current event loop (use weak reference to avoid circular refs)
-            self._event_loop = current_loop
-            self._event_loop_ref = weakref.ref(current_loop)
+                # Create new client for new event loop with a fresh AioSession
+                session = aiobotocore.session.AioSession()
+                self._client_context = session.create_client("rds-data")
+                self._client = await self._client_context.__aenter__()
+                # Store new client, context manager, and event loop ID
+                _rds_data_client_context.set((self._client, self._client_context, current_loop_id))
 
     async def close(self):
-        await self._safe_cleanup_client()
+        """Clean up client resources."""
+        # Only clean up if we own the client and we're the one who created it
+        if self._owns_client and self._client_context is not None:
+            # Check if we're still the owner in the context
+            stored = _rds_data_client_context.get()
+            if stored is not None:
+                stored_client, stored_context, stored_loop_id = stored
+                # Only clean up if our context is still the active one
+                if stored_context is self._client_context:
+                    try:
+                        await self._client_context.__aexit__(None, None, None)
+                        logger.debug("Closed RDS Data API client")
+                    except Exception as e:
+                        logger.debug(f"Failed to close RDS Data API client: {e}")
+                    finally:
+                        # Clear from context
+                        _rds_data_client_context.set(None)
 
-        # Close aiobotocore session (releases internal aiohttp ClientSession)
-        if self._session is not None:
-            try:
-                await self._session.close()
-            except Exception as e:
-                logger.debug(f"Failed to close aiobotocore session: {e}")
-            finally:
-                self._session = None
+            self._client_context = None
 
-        # Reset event loop tracking info
-        self._event_loop = None
-        self._event_loop_ref = None
+        self._client = None
 
     async def commit(self):
         if self._transaction_id:
@@ -217,9 +157,11 @@ class AsyncAuroraDataAPIClient(BaseAuroraDataAPIClient):
             self._transaction_id = None
 
     async def cursor(self):
+        # Always ensure client is available for current event loop
+        await self._ensure_client()
+
         if not self._skip_begin_transaction and self._transaction_id is None:
             self._begin_check()
-            await self._ensure_client()
             res = await self._client.begin_transaction(
                 database=self._dbname,
                 resourceArn=self._aurora_cluster_arn,
