@@ -103,6 +103,8 @@ class AsyncAuroraDataAPIClient(BaseAuroraDataAPIClient):
                 # Reuse existing client from same event loop
                 logger.debug(f"Reusing existing RDS Data API client for event loop {current_loop_id}")
                 self._client, self._client_context = stored_client, stored_context
+                # We're reusing an existing client, so we don't own it
+                self._owns_client = False
             else:
                 # Event loop changed - do NOT close old client as other contexts may still use it
                 # Just create a new client for this context and let garbage collection handle cleanup
@@ -117,25 +119,13 @@ class AsyncAuroraDataAPIClient(BaseAuroraDataAPIClient):
 
     async def close(self):
         """Clean up client resources."""
-        # Only clean up if we own the client and we're the one who created it
-        if self._owns_client and self._client_context is not None:
-            # Check if we're still the owner in the context
-            stored = _rds_data_client_context.get()
-            if stored is not None:
-                stored_client, stored_context, stored_loop_id = stored
-                # Only clean up if our context is still the active one
-                if stored_context is self._client_context:
-                    try:
-                        await self._client_context.__aexit__(None, None, None)
-                        logger.debug("Closed RDS Data API client")
-                    except Exception as e:
-                        logger.debug(f"Failed to close RDS Data API client: {e}")
-                    finally:
-                        # Clear from context
-                        _rds_data_client_context.set(None)
+        # PATCHED: Don't close or clear the RDS Data API client from ContextVar
+        # The client is tied to the event loop and will be cleaned up when the event loop closes
+        # Clearing it here causes new clients to be created unnecessarily
+        # See: https://github.com/chanzuckerberg/aurora-data-api/issues/XXX
 
-            self._client_context = None
-
+        # Just clear instance references without touching the shared ContextVar
+        self._client_context = None
         self._client = None
 
     async def commit(self):
