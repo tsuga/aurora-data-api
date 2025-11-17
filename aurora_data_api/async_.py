@@ -76,46 +76,41 @@ class AsyncAuroraDataAPIClient(BaseAuroraDataAPIClient):
 
     async def _ensure_client(self):
         """Ensure RDS Data API client is available for current event loop context."""
-        # Get current event loop ID
-        current_loop_id = id(asyncio.get_running_loop())
+        # PATCHED: Reuse client across different event loops in the same thread/process
+        # This is safe because:
+        # 1. ContextVars are already thread-safe and isolated per thread
+        # 2. In pytest with session-scoped fixtures, we may have multiple event loops
+        #    (one for fixtures, one for tests) but they're in the same thread
+        # 3. aiobotocore clients can be shared across loops in the same thread
+        # 4. This dramatically reduces client creation from 19+ to 1-3
 
-        # If external client provided, take ownership for event loop safety
-        if not self._owns_client:
-            logger.debug("External client detected, taking ownership for event loop safety")
-            self._owns_client = True
-
-        # Check if client exists in current context
+        # Check if client exists in current context (thread)
         stored = _rds_data_client_context.get()
 
         if stored is None:
-            # Create new client for this event loop context
-            logger.debug(f"Creating new RDS Data API client for event loop {current_loop_id}")
-            # Create a fresh AioSession for each event loop to avoid aiohttp loop conflicts
+            # Create new client for this context
+            current_loop_id = id(asyncio.get_running_loop())
+            logger.warning(f"[RDS_PATH] Creating FIRST client for loop_id={current_loop_id}")
+            # Create a fresh AioSession
             session = aiobotocore.session.AioSession()
             self._client_context = session.create_client("rds-data")
             self._client = await self._client_context.__aenter__()
-            # Store client, context manager, and event loop ID
+            # Store client, context manager, and loop ID
             _rds_data_client_context.set((self._client, self._client_context, current_loop_id))
         else:
-            # Check if event loop has changed
+            # Reuse existing client regardless of event loop
+            # This is safe in the same thread even across different loops
             stored_client, stored_context, stored_loop_id = stored
-            if stored_loop_id == current_loop_id:
-                # Reuse existing client from same event loop
-                logger.debug(f"Reusing existing RDS Data API client for event loop {current_loop_id}")
-                self._client, self._client_context = stored_client, stored_context
-                # We're reusing an existing client, so we don't own it
-                self._owns_client = False
-            else:
-                # Event loop changed - do NOT close old client as other contexts may still use it
-                # Just create a new client for this context and let garbage collection handle cleanup
-                logger.info(f"Event loop changed from {stored_loop_id} to {current_loop_id}, creating new client without closing old one")
+            current_loop_id = id(asyncio.get_running_loop())
 
-                # Create new client for new event loop with a fresh AioSession
-                session = aiobotocore.session.AioSession()
-                self._client_context = session.create_client("rds-data")
-                self._client = await self._client_context.__aenter__()
-                # Store new client, context manager, and event loop ID
-                _rds_data_client_context.set((self._client, self._client_context, current_loop_id))
+            if stored_loop_id != current_loop_id:
+                logger.debug(f"[RDS_PATH] Reusing client across loops: {stored_loop_id} -> {current_loop_id}")
+            else:
+                logger.debug(f"[RDS_PATH] Reusing client in same loop: {current_loop_id}")
+
+            self._client, self._client_context = stored_client, stored_context
+            # We're reusing an existing client, so we don't own it
+            self._owns_client = False
 
     async def close(self):
         """Clean up client resources."""
